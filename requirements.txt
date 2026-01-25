@@ -1,0 +1,7 @@
+github-copilot-sdk>=0.1.18
+fastapi>=0.110.0
+uvicorn>=0.27.0
+psutil>=5.9.0
+aiofiles>=23.2.0
+sse-starlette>=2.0.0
+aiohttp>=3.9.0
