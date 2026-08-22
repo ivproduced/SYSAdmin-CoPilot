@@ -1,175 +1,175 @@
-"""
-Web API Server
-FastAPI backend with streaming support for the Copilot Ops system
-"""
+"""FastAPI interface for the Copilot system-operations agent."""
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
-from pydantic import BaseModel
-from typing import Optional
-import asyncio
+from __future__ import annotations
+
 import json
+import logging
+from collections.abc import Sequence
+from contextlib import asynccontextmanager
+from typing import Any
 
-from tool_gateway import ToolGateway
-from system_tools import SYSTEM_TOOLS
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+
+from configuration import load_tool_definitions
 from copilot_agent import CopilotAgent
+from settings import AppSettings
+from tool_gateway import ToolDefinition, ToolGateway
 
-# Try to load internal tools if they exist
-try:
-    import sys
-    from pathlib import Path
-    internal_path = Path(__file__).parent / ".internal"
-    if internal_path.exists():
-        sys.path.insert(0, str(internal_path))
-        from tima_tools import TIMA_TOOLS
-        ALL_TOOLS = SYSTEM_TOOLS + TIMA_TOOLS
-        print("[Server] Loaded system tools + internal TIMA tools")
-    else:
-        ALL_TOOLS = SYSTEM_TOOLS
-        print("[Server] Loaded system tools only (no .internal directory)")
-except ImportError as e:
-    ALL_TOOLS = SYSTEM_TOOLS
-    print(f"[Server] Loaded system tools only (internal tools not available: {e})")
+logger = logging.getLogger(__name__)
 
 
-# Initialize components
-tool_gateway = ToolGateway()
-for tool in ALL_TOOLS:
-    tool_gateway.register_tool(tool)
-
-agent = CopilotAgent(tool_gateway)
-
-
-# FastAPI app
-app = FastAPI(
-    title="Copilot Ops Control Plane",
-    description="AI-native system operations via GitHub Copilot SDK",
-    version="0.1.0"
-)
-
-# Enable CORS for development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# Request models
 class ChatMessage(BaseModel):
-    message: str
-    session_id: Optional[str] = None
+    message: str = Field(min_length=1)
+    # Reserved for the authenticated, per-user session manager milestone.
+    session_id: str | None = None
 
 
-# Initialize agent on startup
-@app.on_event("startup")
-async def startup():
-    print("🚀 Starting Copilot Ops Control Plane...")
-    await agent.initialize()
-    print("✅ System ready")
+def create_app(
+    *,
+    settings: AppSettings | None = None,
+    tool_definitions: Sequence[ToolDefinition] | None = None,
+    agent_instance: Any | None = None,
+) -> FastAPI:
+    """Create an application with injectable components for reliable tests."""
 
+    runtime_settings = settings or AppSettings.from_env()
+    runtime_settings.validate()
+    gateway = ToolGateway(
+        runtime_settings.log_directory,
+        audit_logging=runtime_settings.audit_logging,
+    )
+    selected_tools = (
+        load_tool_definitions() if tool_definitions is None else tool_definitions
+    )
+    for tool in selected_tools:
+        gateway.register_tool(tool)
 
-@app.on_event("shutdown")
-async def shutdown():
-    print("🛑 Shutting down...")
-    await agent.cleanup()
-
-
-# API Endpoints
-
-@app.get("/")
-async def root():
-    """Root endpoint - returns web interface"""
-    return HTMLResponse(
-        content=get_web_interface(),
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        }
+    runtime_agent = agent_instance or CopilotAgent(
+        gateway,
+        base_directory=runtime_settings.copilot_base_directory,
+        model=runtime_settings.model,
+        request_timeout_seconds=runtime_settings.request_timeout_seconds,
     )
 
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "agent": agent.get_stats()
-    }
-
-
-@app.get("/api/tools")
-async def list_tools():
-    """List all registered tools"""
-    tools = []
-    for tool_name, tool_def in tool_gateway.tools.items():
-        tools.append({
-            "name": tool_def.name,
-            "description": tool_def.description,
-            "permission": tool_def.permission.value,
-            "category": tool_def.category
-        })
-    return {"tools": tools}
-
-
-@app.get("/api/stats")
-async def get_stats():
-    """Get system statistics"""
-    return {
-        "agent": agent.get_stats(),
-        "gateway": tool_gateway.get_stats()
-    }
-
-
-@app.post("/api/chat")
-async def chat(message: ChatMessage):
-    """
-    Chat endpoint with Server-Sent Events streaming
-    
-    Returns a stream of events as the agent processes the message
-    """
-    async def event_generator():
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        logger.info("Starting Copilot Ops Control Plane")
+        application.state.startup_error = None
         try:
-            async for response in agent.process_message(message.message):
-                # Format as SSE event
-                data = {
-                    "type": response.type,
-                    "content": response.content,
-                    "tool_name": response.tool_name,
-                    "tool_output": response.tool_output,
-                    "error": response.error
-                }
-                
-                yield {
-                    "event": response.type,
-                    "data": json.dumps(data)
-                }
-                
-                # Small delay to allow client to process
-                await asyncio.sleep(0.01)
-        
-        except Exception as e:
-            yield {
-                "event": "error",
-                "data": json.dumps({"error": str(e)})
+            await application.state.agent.initialize()
+        except Exception as exc:
+            application.state.startup_error = str(exc)
+            logger.exception("Copilot agent was unavailable during startup")
+        try:
+            yield
+        finally:
+            await application.state.agent.cleanup()
+
+    application = FastAPI(
+        title="Copilot Ops Control Plane",
+        description="AI-native, read-only system operations via GitHub Copilot SDK",
+        version="0.2.0",
+        lifespan=lifespan,
+    )
+    application.state.settings = runtime_settings
+    application.state.tool_gateway = gateway
+    application.state.agent = runtime_agent
+
+    if runtime_settings.cors_origins:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(runtime_settings.cors_origins),
+            allow_credentials=False,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Content-Type", "Authorization"],
+        )
+
+    @application.get("/")
+    async def root() -> HTMLResponse:
+        return HTMLResponse(
+            content=get_web_interface(),
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
+
+    @application.get("/health")
+    async def health_check(request: Request) -> dict[str, Any]:
+        stats = request.app.state.agent.get_stats()
+        return {
+            "status": "healthy" if stats.get("initialized") else "degraded",
+            "agent": stats,
+            "error": request.app.state.startup_error,
+        }
+
+    @application.get("/api/tools")
+    async def list_tools(request: Request) -> dict[str, Any]:
+        tools = [
+            {
+                "name": definition.name,
+                "description": definition.description,
+                "permission": definition.permission.value,
+                "category": definition.category,
             }
-    
-    return EventSourceResponse(event_generator())
+            for definition in request.app.state.tool_gateway.tools.values()
+        ]
+        return {"tools": tools}
+
+    @application.get("/api/stats")
+    async def get_stats(request: Request) -> dict[str, Any]:
+        return {
+            "agent": request.app.state.agent.get_stats(),
+            "gateway": request.app.state.tool_gateway.get_stats(),
+        }
+
+    @application.post("/api/chat")
+    async def chat(message: ChatMessage, request: Request) -> EventSourceResponse:
+        if len(message.message) > request.app.state.settings.max_message_length:
+            raise HTTPException(status_code=422, detail="Message is too long")
+
+        async def event_generator():
+            try:
+                async for response in request.app.state.agent.process_message(
+                    message.message
+                ):
+                    if await request.is_disconnected():
+                        break
+                    data = {
+                        "type": response.type,
+                        "content": response.content,
+                        "tool_name": response.tool_name,
+                        "tool_input": response.tool_input,
+                        "tool_output": response.tool_output,
+                        "error": response.error,
+                    }
+                    yield {"event": response.type, "data": json.dumps(data)}
+            except Exception as exc:
+                logger.exception("Chat stream failed")
+                yield {
+                    "event": "error",
+                    "data": json.dumps({"type": "error", "error": str(exc)}),
+                }
+
+        return EventSourceResponse(event_generator())
+
+    @application.get("/api/logs")
+    async def get_logs(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> dict[str, Any]:
+        logs = request.app.state.tool_gateway.audit_logger.get_recent_logs(limit)
+        return {"logs": [log.to_dict() for log in logs]}
+
+    return application
 
 
-@app.get("/api/logs")
-async def get_logs(limit: int = 50):
-    """Get recent audit logs"""
-    logs = tool_gateway.audit_logger.get_recent_logs(limit)
-    return {
-        "logs": [log.to_dict() for log in logs]
-    }
+app = create_app()
 
 
 def get_web_interface() -> str:
@@ -419,13 +419,10 @@ I can help you monitor and manage your system. Try:
     </div>
     
     <script>
-        console.log('Script loaded!');
         const chat = document.getElementById('chat');
         const input = document.getElementById('input');
         const sendBtn = document.getElementById('send');
         const thinking = document.getElementById('thinking');
-        
-        console.log('Elements:', { chat, input, sendBtn, thinking });
         
         // Auto-resize textarea
         input.addEventListener('input', function() {
@@ -442,15 +439,12 @@ I can help you monitor and manage your system. Try:
         });
         
         // Send button click
-        sendBtn.addEventListener('click', function(e) {
-            console.log('Button clicked!');
+        sendBtn.addEventListener('click', function() {
             sendMessage();
         });
         
         async function sendMessage() {
-            console.log('sendMessage called');
             const message = input.value.trim();
-            console.log('Message:', message);
             if (!message) return;
             
             // Add user message
@@ -471,32 +465,49 @@ I can help you monitor and manage your system. Try:
                     },
                     body: JSON.stringify({ message })
                 });
-                
+                if (!response.ok || !response.body) {
+                    throw new Error(`Request failed with HTTP ${response.status}`);
+                }
+
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let assistantMsg = null;
+                let buffer = '';
                 
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
-                    
-                    const text = decoder.decode(value);
-                    const lines = text.split('\n');
-                    
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.slice(6));
-                                
-                                if (data.type === 'complete' && data.content) {
-                                    assistantMsg = addMessage('assistant', data.content);
-                                }
-                                else if (data.type === 'error') {
-                                    assistantMsg = addMessage('assistant', '❌ ' + (data.error || 'An error occurred'), true);
-                                }
-                            } catch (e) {
-                                console.error('Parse error:', e);
-                            }
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const eventBlocks = buffer.split(/\r?\n\r?\n/);
+                    buffer = eventBlocks.pop() || '';
+
+                    for (const eventBlock of eventBlocks) {
+                        const payload = eventBlock
+                            .split(/\r?\n/)
+                            .filter(line => line.startsWith('data:'))
+                            .map(line => line.slice(5).trimStart())
+                            .join('\n');
+                        if (!payload) continue;
+
+                        const data = JSON.parse(payload);
+                        if (data.type === 'message_delta' && data.content) {
+                            if (!assistantMsg) assistantMsg = addMessage('assistant', '');
+                            assistantMsg.querySelector('.message-content').textContent += data.content;
+                            chat.scrollTop = chat.scrollHeight;
+                        }
+                        else if (data.type === 'complete' && data.content) {
+                            if (!assistantMsg) assistantMsg = addMessage('assistant', data.content);
+                            else assistantMsg.querySelector('.message-content').textContent = data.content;
+                        }
+                        else if (data.type === 'tool_call' && data.tool_name) {
+                            thinking.querySelector('span').textContent = `Running ${data.tool_name}...`;
+                        }
+                        else if (data.type === 'tool_result') {
+                            thinking.querySelector('span').textContent = 'Thinking...';
+                        }
+                        else if (data.type === 'error') {
+                            assistantMsg = addMessage('assistant', '❌ ' + (data.error || 'An error occurred'), true);
                         }
                     }
                 }
@@ -513,6 +524,7 @@ I can help you monitor and manage your system. Try:
                 sendBtn.disabled = false;
                 input.disabled = false;
                 thinking.classList.remove('active');
+                thinking.querySelector('span').textContent = 'Thinking...';
                 input.focus();
             }
         }
@@ -550,19 +562,17 @@ I can help you monitor and manage your system. Try:
 
 if __name__ == "__main__":
     import uvicorn
-    
-    print("\n" + "="*60)
-    print("🚀 Copilot Ops Control Plane")
-    print("="*60)
-    print("\nStarting server...")
-    print("\n📍 Access via:")
-    print("   • Local:     http://localhost:8000")
-    print("   • Tailscale: http://<tailscale-ip>:8000")
-    print("\n" + "="*60 + "\n")
-    
+
+    runtime_settings = AppSettings.from_env()
+    logging.basicConfig(level=logging.INFO)
+    logger.info(
+        "Serving Copilot Ops at http://%s:%d",
+        runtime_settings.host,
+        runtime_settings.port,
+    )
     uvicorn.run(
         app,
-        host="0.0.0.0",  # Listen on all interfaces (required for Tailscale)
-        port=8000,
-        log_level="info"
+        host=runtime_settings.host,
+        port=runtime_settings.port,
+        log_level="info",
     )

@@ -1,264 +1,298 @@
-"""
-Tool Gateway Layer
-Handles tool registration, validation, execution, and audit logging.
-"""
+"""Validation, execution, and audit boundary for agent tools."""
 
-import json
+from __future__ import annotations
+
 import asyncio
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
-from dataclasses import dataclass, field, asdict
+import json
+import os
+import threading
+import time
+from collections import deque
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
 
 
 class ToolPermission(Enum):
-    """Tool permission levels"""
-    READ = "read"      # Read-only operations
-    WRITE = "write"    # Can modify system
-    ADMIN = "admin"    # Full system access
+    """Declared sensitivity of a tool operation."""
+
+    READ = "read"
+    WRITE = "write"
+    ADMIN = "admin"
 
 
-@dataclass
+@dataclass(frozen=True)
 class ToolDefinition:
-    """Tool definition with schema and metadata"""
+    """Tool metadata and callback registered with the gateway."""
+
     name: str
     description: str
     permission: ToolPermission
-    input_schema: Dict[str, Any]
-    callback: Callable
+    input_schema: dict[str, Any]
+    callback: Callable[[dict[str, Any], dict[str, Any]], Any]
     category: str = "general"
-    
-    def to_copilot_format(self) -> Dict[str, Any]:
-        """Convert to Copilot SDK tool format"""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": self.input_schema,
-            "callback": self.callback
-        }
 
 
 @dataclass
 class ToolExecution:
-    """Record of tool execution"""
+    """Audit record for one attempted tool execution."""
+
     tool_name: str
     timestamp: str
     permission_level: str
-    input_params: Dict[str, Any]
+    input_params: dict[str, Any]
     success: bool
-    output: Optional[str] = None
-    error: Optional[str] = None
+    output: str | None = None
+    error: str | None = None
     duration_ms: float = 0.0
-    
-    def to_dict(self) -> Dict[str, Any]:
+
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
+class ToolGatewayError(RuntimeError):
+    """Base class for controlled gateway failures."""
+
+
+class ToolNotFoundError(ToolGatewayError):
+    """Raised when a requested tool is not registered."""
+
+
+class ToolValidationError(ToolGatewayError):
+    """Raised when tool arguments do not match the declared schema."""
+
+
+class ToolAuthorizationError(ToolGatewayError):
+    """Raised when the caller is not allowed to execute a tool."""
+
+
+class ToolExecutionError(ToolGatewayError):
+    """Raised when a registered tool callback fails."""
+
+
 class AuditLogger:
-    """Audit logger for tool executions"""
-    
-    def __init__(self, log_dir: Path):
+    """Append-only JSONL audit logger with daily file rotation."""
+
+    def __init__(self, log_dir: Path, enabled: bool = True):
         self.log_dir = log_dir
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_file = self.log_dir / f"audit_{datetime.now().strftime('%Y%m%d')}.jsonl"
-    
-    def log(self, execution: ToolExecution):
-        """Log a tool execution"""
-        with open(self.log_file, 'a') as f:
-            f.write(json.dumps(execution.to_dict()) + '\n')
-    
-    def get_recent_logs(self, limit: int = 50) -> List[ToolExecution]:
-        """Get recent audit logs"""
-        logs = []
-        if self.log_file.exists():
-            with open(self.log_file, 'r') as f:
-                lines = f.readlines()
-                for line in lines[-limit:]:
-                    try:
-                        data = json.loads(line)
-                        logs.append(ToolExecution(**data))
-                    except:
-                        pass
+        self.enabled = enabled
+        self._write_lock = threading.Lock()
+
+    def _log_file(self, timestamp: datetime | None = None) -> Path:
+        timestamp = timestamp or datetime.now(UTC)
+        return self.log_dir / f"audit_{timestamp.strftime('%Y%m%d')}.jsonl"
+
+    def log(self, execution: ToolExecution) -> None:
+        if not self.enabled:
+            return
+
+        payload = json.dumps(execution.to_dict(), ensure_ascii=False) + "\n"
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        with self._write_lock:
+            self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            descriptor = os.open(self._log_file(), flags, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as log_file:
+                log_file.write(payload)
+
+    def get_recent_logs(self, limit: int = 50) -> list[ToolExecution]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+
+        log_file = self._log_file()
+        if not self.enabled or not log_file.exists():
+            return []
+
+        logs: list[ToolExecution] = []
+        with log_file.open("r", encoding="utf-8") as file_handle:
+            lines = deque(file_handle, maxlen=limit)
+
+        for line in lines:
+            try:
+                logs.append(ToolExecution(**json.loads(line)))
+            except (json.JSONDecodeError, TypeError):
+                continue
         return logs
 
 
 class ToolGateway:
-    """
-    Tool Gateway - Core security and execution layer
-    
-    Responsibilities:
-    - Tool registration and validation
-    - Permission checking
-    - Input schema validation
-    - Execution with error handling
-    - Audit logging
-    """
-    
-    def __init__(self, log_dir: Optional[Path] = None):
-        self.tools: Dict[str, ToolDefinition] = {}
-        self.audit_logger = AuditLogger(log_dir or Path.home() / ".copilot-ops" / "logs")
+    """Register and execute tools through a single validated audit boundary."""
+
+    def __init__(
+        self,
+        log_dir: Path | None = None,
+        *,
+        audit_logging: bool = True,
+    ):
+        self.tools: dict[str, ToolDefinition] = {}
+        self.audit_logger = AuditLogger(
+            log_dir or Path.home() / ".copilot-ops" / "logs",
+            enabled=audit_logging,
+        )
         self._execution_count = 0
-    
-    def register_tool(self, tool: ToolDefinition):
-        """Register a tool in the gateway"""
+        self._success_count = 0
+        self._failure_count = 0
+
+    def register_tool(self, tool: ToolDefinition) -> None:
         if tool.name in self.tools:
             raise ValueError(f"Tool '{tool.name}' is already registered")
-        
-        # Validate tool definition
         self._validate_tool_definition(tool)
-        
         self.tools[tool.name] = tool
-        print(f"[ToolGateway] Registered tool: {tool.name} ({tool.permission.value})")
-    
-    def _validate_tool_definition(self, tool: ToolDefinition):
-        """Validate tool definition"""
+
+    def _validate_tool_definition(self, tool: ToolDefinition) -> None:
         if not tool.name:
             raise ValueError("Tool name is required")
         if not tool.description:
             raise ValueError("Tool description is required")
+        if not isinstance(tool.permission, ToolPermission):
+            raise TypeError("Tool permission must be a ToolPermission")
         if not tool.input_schema:
             raise ValueError("Tool input_schema is required")
         if not callable(tool.callback):
-            raise ValueError("Tool callback must be callable")
-    
-    def _validate_input(self, tool: ToolDefinition, params: Dict[str, Any]) -> bool:
-        """Validate input parameters against schema"""
-        schema = tool.input_schema
-        
-        # Check required parameters
-        required = schema.get("required", [])
-        for param in required:
-            if param not in params:
-                raise ValueError(f"Missing required parameter: {param}")
-        
-        # Check parameter types (basic validation)
-        properties = schema.get("properties", {})
-        for param, value in params.items():
-            if param in properties:
-                expected_type = properties[param].get("type")
-                if expected_type == "string" and not isinstance(value, str):
-                    raise TypeError(f"Parameter '{param}' must be a string")
-                elif expected_type == "integer" and not isinstance(value, int):
-                    raise TypeError(f"Parameter '{param}' must be an integer")
-                elif expected_type == "boolean" and not isinstance(value, bool):
-                    raise TypeError(f"Parameter '{param}' must be a boolean")
-        
-        return True
-    
+            raise TypeError("Tool callback must be callable")
+        try:
+            Draft202012Validator.check_schema(tool.input_schema)
+        except SchemaError as exc:
+            raise ValueError(
+                f"Invalid schema for tool '{tool.name}': {exc.message}"
+            ) from exc
+
+    def _validate_input(self, tool: ToolDefinition, params: dict[str, Any]) -> None:
+        if not isinstance(params, dict):
+            raise ToolValidationError("Tool arguments must be a JSON object")
+        try:
+            Draft202012Validator(tool.input_schema).validate(params)
+        except ValidationError as exc:
+            location = ".".join(str(part) for part in exc.absolute_path)
+            prefix = (
+                f"Invalid parameter '{location}'" if location else "Invalid parameters"
+            )
+            raise ToolValidationError(f"{prefix}: {exc.message}") from exc
+
+    def _authorize(self, tool: ToolDefinition, context: dict[str, Any]) -> None:
+        configured = context.get("allowed_permissions", {ToolPermission.READ})
+        if isinstance(configured, (str, ToolPermission)):
+            configured = [configured]
+        try:
+            allowed_permissions = {
+                permission
+                if isinstance(permission, ToolPermission)
+                else ToolPermission(str(permission).lower())
+                for permission in configured
+            }
+        except (TypeError, ValueError) as exc:
+            raise ToolAuthorizationError("Invalid permission context") from exc
+        if tool.permission not in allowed_permissions:
+            raise ToolAuthorizationError(
+                f"Permission '{tool.permission.value}' is not authorized for this request"
+            )
+
     async def execute_tool(
         self,
         tool_name: str,
-        params: Dict[str, Any],
-        context: Optional[Dict[str, Any]] = None
+        params: dict[str, Any],
+        context: dict[str, Any] | None = None,
     ) -> str:
-        """
-        Execute a tool with full validation and audit logging
-        
-        Returns:
-            Tool output as string
-        """
-        start_time = datetime.now()
-        
-        # Get tool
-        if tool_name not in self.tools:
-            error = f"Tool '{tool_name}' not found"
-            self._log_execution(tool_name, params, False, error=error, duration=0)
-            return f"❌ {error}"
-        
-        tool = self.tools[tool_name]
-        
+        """Validate, execute, and audit one tool call."""
+
+        start_time = time.perf_counter()
+        tool = self.tools.get(tool_name)
+        if tool is None:
+            error = ToolNotFoundError(f"Tool '{tool_name}' is not registered")
+            self._record_execution(
+                tool_name, params, False, error=str(error), start_time=start_time
+            )
+            raise error
+
         try:
-            # Validate input
+            execution_context = dict(context or {})
+            execution_context.setdefault("audit_logger", self.audit_logger)
+            self._authorize(tool, execution_context)
             self._validate_input(tool, params)
-            
-            # Execute tool
+
             if asyncio.iscoroutinefunction(tool.callback):
-                result = await tool.callback(params, context or {})
+                result = await tool.callback(params, execution_context)
             else:
-                result = tool.callback(params, context or {})
-            
-            # Calculate duration
-            duration = (datetime.now() - start_time).total_seconds() * 1000
-            
-            # Debug logging
-            print(f"[ToolGateway] Tool '{tool_name}' result: {str(result)[:200]}")
-            
-            # Log success
-            self._log_execution(
+                result = await asyncio.to_thread(
+                    tool.callback, params, execution_context
+                )
+
+            output = str(result)
+            self._record_execution(
                 tool_name,
                 params,
                 True,
-                output=str(result),
-                duration=duration,
-                permission=tool.permission.value
+                output=output,
+                permission=tool.permission.value,
+                start_time=start_time,
             )
-            
-            self._execution_count += 1
-            
-            return str(result)
-        
-        except Exception as e:
-            # Calculate duration
-            duration = (datetime.now() - start_time).total_seconds() * 1000
-            
-            # Log failure
-            error_msg = f"{type(e).__name__}: {str(e)}"
-            self._log_execution(
+            return output
+        except Exception as exc:
+            self._record_execution(
                 tool_name,
                 params,
                 False,
-                error=error_msg,
-                duration=duration,
-                permission=tool.permission.value
+                error=f"{type(exc).__name__}: {exc}",
+                permission=tool.permission.value,
+                start_time=start_time,
             )
-            
-            return f"❌ Tool execution failed: {error_msg}"
-    
-    def _log_execution(
+            if isinstance(exc, ToolGatewayError):
+                raise
+            raise ToolExecutionError(
+                f"Tool '{tool_name}' failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    def _record_execution(
         self,
         tool_name: str,
-        params: Dict[str, Any],
+        params: dict[str, Any],
         success: bool,
-        output: Optional[str] = None,
-        error: Optional[str] = None,
-        duration: float = 0.0,
-        permission: str = "unknown"
-    ):
-        """Log tool execution to audit log"""
-        execution = ToolExecution(
-            tool_name=tool_name,
-            timestamp=datetime.now().isoformat(),
-            permission_level=permission,
-            input_params=params,
-            success=success,
-            output=output,
-            error=error,
-            duration_ms=duration
+        *,
+        output: str | None = None,
+        error: str | None = None,
+        permission: str = "unknown",
+        start_time: float,
+    ) -> None:
+        self._execution_count += 1
+        if success:
+            self._success_count += 1
+        else:
+            self._failure_count += 1
+
+        self.audit_logger.log(
+            ToolExecution(
+                tool_name=tool_name,
+                timestamp=datetime.now(UTC).isoformat(),
+                permission_level=permission,
+                input_params=params,
+                success=success,
+                output=output,
+                error=error,
+                duration_ms=(time.perf_counter() - start_time) * 1000,
+            )
         )
-        
-        self.audit_logger.log(execution)
-    
-    def get_tool_definitions(self) -> List[ToolDefinition]:
-        """Get all tool definitions"""
+
+    def get_tool_definitions(self) -> list[ToolDefinition]:
         return list(self.tools.values())
-    
-    def get_tool_definitions_for_copilot(self) -> List[Dict[str, Any]]:
-        """Get tool definitions in Copilot SDK format"""
-        return [tool.to_copilot_format() for tool in self.tools.values()]
-    
-    def get_tools_by_permission(self, permission: ToolPermission) -> List[ToolDefinition]:
-        """Get tools by permission level"""
-        return [t for t in self.tools.values() if t.permission == permission]
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get gateway statistics"""
+
+    def get_tools_by_permission(
+        self, permission: ToolPermission
+    ) -> list[ToolDefinition]:
+        return [tool for tool in self.tools.values() if tool.permission == permission]
+
+    def get_stats(self) -> dict[str, Any]:
         return {
             "registered_tools": len(self.tools),
             "executions": self._execution_count,
+            "successful_executions": self._success_count,
+            "failed_executions": self._failure_count,
             "tools_by_permission": {
-                "read": len(self.get_tools_by_permission(ToolPermission.READ)),
-                "write": len(self.get_tools_by_permission(ToolPermission.WRITE)),
-                "admin": len(self.get_tools_by_permission(ToolPermission.ADMIN))
-            }
+                permission.value: len(self.get_tools_by_permission(permission))
+                for permission in ToolPermission
+            },
         }
