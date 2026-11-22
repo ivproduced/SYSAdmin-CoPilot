@@ -1,7 +1,7 @@
-github-copilot-sdk==1.0.11
-fastapi==0.141.1
-uvicorn==0.52.4
+github-copilot-sdk==1.0.35
+fastapi==0.165.0
+uvicorn==0.54.0
 psutil==7.2.2
-pydantic==2.13.4
-sse-starlette==3.4.8
+pydantic==2.14.3
+sse-starlette==3.7.0
 jsonschema==4.26.0
