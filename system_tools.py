@@ -1,429 +1,333 @@
-"""
-System Tools - Core operations tools as defined in the plan
-"""
+"""Cross-platform, read-only system inspection tools."""
+
+from __future__ import annotations
+
+import platform
+import socket
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import psutil
-import platform
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, Any
+
+from tool_gateway import AuditLogger, ToolDefinition, ToolPermission
 
 
-async def get_system_info(params: Dict[str, Any], context: Dict[str, Any]) -> str:
-    """
-    Get system information including CPU, memory, disk, and uptime
-    
-    Permission: READ
-    """
+def get_system_info(params: dict[str, Any], context: dict[str, Any]) -> str:
+    """Get CPU, memory, disk, uptime, and platform information."""
+
+    cpu_percent = psutil.cpu_percent(interval=1)
+    cpu_count = psutil.cpu_count()
+    memory = psutil.virtual_memory()
+    root_path = Path.home().anchor or "/"
+    disk = psutil.disk_usage(root_path)
     try:
-        # CPU info
-        cpu_percent = psutil.cpu_percent(interval=1)
-        cpu_count = psutil.cpu_count()
-        
-        # Memory info
-        memory = psutil.virtual_memory()
-        memory_gb = memory.total / (1024**3)
-        memory_used_gb = memory.used / (1024**3)
-        memory_percent = memory.percent
-        
-        # Disk info
-        disk = psutil.disk_usage('/')
-        disk_total_gb = disk.total / (1024**3)
-        disk_used_gb = disk.used / (1024**3)
-        disk_percent = disk.percent
-        
-        # System info
-        boot_time = datetime.fromtimestamp(psutil.boot_time())
-        uptime = datetime.now() - boot_time
-        uptime_str = str(uptime).split('.')[0]  # Remove microseconds
-        
-        # Load average (Unix-like systems)
-        try:
-            load_avg = psutil.getloadavg()
-            load_str = f"\n📊 Load Average: {load_avg[0]:.2f}, {load_avg[1]:.2f}, {load_avg[2]:.2f}"
-        except:
-            load_str = ""
-        
-        status = f"""🖥️ System Status
-        
+        uptime_text = str(
+            datetime.now(UTC) - datetime.fromtimestamp(psutil.boot_time(), tz=UTC)
+        ).split(".")[0]
+    except (PermissionError, OSError):
+        uptime_text = "Unavailable"
+    try:
+        process_count: str | int = len(psutil.pids())
+    except (PermissionError, OSError):
+        process_count = "Unavailable"
+
+    try:
+        load_average = psutil.getloadavg()
+        load_text = (
+            f"\n  • Load average: {load_average[0]:.2f}, "
+            f"{load_average[1]:.2f}, {load_average[2]:.2f}"
+        )
+    except (AttributeError, OSError):
+        load_text = ""
+
+    return f"""🖥️ System Status
+
 💻 Platform: {platform.system()} {platform.release()}
 🏗️ Architecture: {platform.machine()}
-⏰ Uptime: {uptime_str}
+⏰ Uptime: {uptime_text}
 
 ⚙️ CPU
   • Cores: {cpu_count}
-  • Usage: {cpu_percent}%{load_str}
+  • Usage: {cpu_percent}%{load_text}
 
 🧠 Memory
-  • Total: {memory_gb:.1f} GB
-  • Used: {memory_used_gb:.1f} GB ({memory_percent}%)
+  • Total: {memory.total / (1024**3):.1f} GB
+  • Used: {memory.used / (1024**3):.1f} GB ({memory.percent}%)
   • Available: {memory.available / (1024**3):.1f} GB
 
-💾 Disk (/)
-  • Total: {disk_total_gb:.1f} GB
-  • Used: {disk_used_gb:.1f} GB ({disk_percent}%)
+💾 Disk ({root_path})
+  • Total: {disk.total / (1024**3):.1f} GB
+  • Used: {disk.used / (1024**3):.1f} GB ({disk.percent}%)
   • Free: {disk.free / (1024**3):.1f} GB
 
-🔄 Processes: {len(psutil.pids())} running
-"""
-        
-        return status.strip()
-    
-    except Exception as e:
-        return f"❌ Error getting system status: {str(e)}"
+🔄 Processes: {process_count}"""
 
 
-async def check_disk_space(params: Dict[str, Any], context: Dict[str, Any]) -> str:
-    """
-    Check disk usage for a specific path or all mounted partitions
-    
-    Permission: READ
-    Parameters:
-        path (optional): Specific path to check
-        detailed (optional): Show detailed partition info
-    """
-    try:
-        path = params.get("path")
-        detailed = params.get("detailed", False)
-        
-        if path:
-            # Check specific path
-            disk = psutil.disk_usage(path)
-            total_gb = disk.total / (1024**3)
-            used_gb = disk.used / (1024**3)
-            free_gb = disk.free / (1024**3)
-            
-            return f"""💾 Disk Usage: {path}
+def check_disk_space(params: dict[str, Any], context: dict[str, Any]) -> str:
+    """Check disk usage for a path or every mounted partition."""
 
-Total: {total_gb:.2f} GB
-Used: {used_gb:.2f} GB ({disk.percent}%)
-Free: {free_gb:.2f} GB
-"""
-        
-        # Check all partitions
-        partitions = psutil.disk_partitions()
-        output = ["💾 Disk Usage - All Partitions\n"]
-        
-        for partition in partitions:
-            try:
-                usage = psutil.disk_usage(partition.mountpoint)
-                total_gb = usage.total / (1024**3)
-                used_gb = usage.used / (1024**3)
-                free_gb = usage.free / (1024**3)
-                
-                output.append(f"📁 {partition.mountpoint}")
-                if detailed:
-                    output.append(f"   Device: {partition.device}")
-                    output.append(f"   Type: {partition.fstype}")
-                output.append(f"   Total: {total_gb:.2f} GB")
-                output.append(f"   Used: {used_gb:.2f} GB ({usage.percent}%)")
-                output.append(f"   Free: {free_gb:.2f} GB")
-                output.append("")
-            except PermissionError:
-                output.append(f"📁 {partition.mountpoint} (access denied)")
-                output.append("")
-        
-        return "\n".join(output).strip()
-    
-    except Exception as e:
-        return f"❌ Error checking disk: {str(e)}"
+    path = params.get("path")
+    detailed = params.get("detailed", False)
+    if path:
+        disk = psutil.disk_usage(path)
+        return f"""💾 Disk Usage: {path}
+
+Total: {disk.total / (1024**3):.2f} GB
+Used: {disk.used / (1024**3):.2f} GB ({disk.percent}%)
+Free: {disk.free / (1024**3):.2f} GB"""
+
+    output = ["💾 Disk Usage - All Partitions", ""]
+    for partition in psutil.disk_partitions():
+        try:
+            usage = psutil.disk_usage(partition.mountpoint)
+        except (PermissionError, OSError):
+            output.extend([f"📁 {partition.mountpoint} (access denied)", ""])
+            continue
+
+        output.append(f"📁 {partition.mountpoint}")
+        if detailed:
+            output.append(f"   Device: {partition.device}")
+            output.append(f"   Type: {partition.fstype}")
+        output.extend(
+            [
+                f"   Total: {usage.total / (1024**3):.2f} GB",
+                f"   Used: {usage.used / (1024**3):.2f} GB ({usage.percent}%)",
+                f"   Free: {usage.free / (1024**3):.2f} GB",
+                "",
+            ]
+        )
+    return "\n".join(output).strip()
 
 
-async def read_logs(params: Dict[str, Any], context: Dict[str, Any]) -> str:
-    """
-    Read audit logs or system logs
-    
-    Permission: READ
-    Parameters:
-        log_type: "audit" or "system" (default: audit)
-        limit: Number of lines to return (default: 20)
-    """
-    try:
-        log_type = params.get("log_type", "audit")
-        limit = params.get("limit", 20)
-        
-        if log_type == "audit":
-            # Read audit logs from tool gateway
-            log_dir = Path.home() / ".copilot-ops" / "logs"
-            log_file = log_dir / f"audit_{datetime.now().strftime('%Y%m%d')}.jsonl"
-            
-            if not log_file.exists():
-                return "📜 No audit logs found for today"
-            
-            with open(log_file, 'r') as f:
-                lines = f.readlines()
-            
-            # Get last N lines
-            recent_lines = lines[-limit:]
-            
-            output = [f"📜 Audit Logs (last {len(recent_lines)} entries)\n"]
-            
-            for line in recent_lines:
-                try:
-                    import json
-                    entry = json.loads(line)
-                    timestamp = entry['timestamp'].split('T')[1].split('.')[0]  # HH:MM:SS
-                    tool = entry['tool_name']
-                    success = "✅" if entry['success'] else "❌"
-                    duration = f"{entry['duration_ms']:.0f}ms"
-                    
-                    output.append(f"[{timestamp}] {success} {tool} ({duration})")
-                    
-                    # Show error if failed
-                    if not entry['success'] and entry.get('error'):
-                        output.append(f"   Error: {entry['error']}")
-                except:
-                    pass
-            
-            return "\n".join(output)
-        
-        elif log_type == "system":
-            # Read system logs (this would vary by OS)
-            # For now, just return process information
-            output = ["🖥️ System Process Info (Top 10 by CPU)\n"]
-            
-            processes = []
-            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent']):
-                try:
-                    pinfo = proc.info
-                    processes.append(pinfo)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            
-            # Sort by CPU usage
-            processes.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
-            
-            for proc in processes[:10]:
-                pid = proc['pid']
-                name = proc['name'][:30]  # Truncate long names
-                cpu = proc['cpu_percent']
-                mem = proc['memory_percent']
-                output.append(f"PID {pid:5d} | {name:30s} | CPU: {cpu:5.1f}% | MEM: {mem:5.1f}%")
-            
-            return "\n".join(output)
-        
-        else:
-            return f"❌ Unknown log type: {log_type}. Use 'audit' or 'system'"
-    
-    except Exception as e:
-        return f"❌ Error reading logs: {str(e)}"
+def read_logs(params: dict[str, Any], context: dict[str, Any]) -> str:
+    """Read gateway audit entries or summarize the busiest processes."""
 
+    log_type = params.get("log_type", "audit")
+    limit = params.get("limit", 20)
 
-async def list_processes(params: Dict[str, Any], context: Dict[str, Any]) -> str:
-    """
-    List running processes with optional filtering
-    
-    Permission: READ
-    Parameters:
-        filter (optional): Filter by process name
-        sort_by: "cpu" or "memory" (default: cpu)
-        limit: Number of processes to show (default: 15)
-    """
-    try:
-        filter_name = params.get("filter", "").lower()
-        sort_by = params.get("sort_by", "cpu")
-        limit = params.get("limit", 15)
-        
-        processes = []
-        for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status']):
-            try:
-                pinfo = proc.info
-                
-                # Apply filter if specified
-                if filter_name and filter_name not in pinfo['name'].lower():
-                    continue
-                
-                processes.append(pinfo)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
-        # Sort
-        if sort_by == "memory":
-            processes.sort(key=lambda x: x.get('memory_percent', 0), reverse=True)
-        else:
-            processes.sort(key=lambda x: x.get('cpu_percent', 0), reverse=True)
-        
-        # Build output
-        filter_str = f" (filtered by '{filter_name}')" if filter_name else ""
-        output = [f"🔄 Running Processes{filter_str} (sorted by {sort_by})\n"]
-        
-        for proc in processes[:limit]:
-            pid = proc['pid']
-            name = proc['name'][:35]
-            cpu = proc['cpu_percent']
-            mem = proc['memory_percent']
-            status = proc['status']
-            
-            output.append(f"PID {pid:6d} | {name:35s} | CPU: {cpu:5.1f}% | MEM: {mem:5.1f}% | {status}")
-        
-        if len(processes) > limit:
-            output.append(f"\n... and {len(processes) - limit} more processes")
-        
+    if log_type == "audit":
+        audit_logger = context.get("audit_logger")
+        if not isinstance(audit_logger, AuditLogger):
+            raise RuntimeError("Audit logger is not available")
+        logs = audit_logger.get_recent_logs(limit)
+        if not logs:
+            return "📜 No audit logs found for today"
+
+        output = [f"📜 Audit Logs (last {len(logs)} entries)", ""]
+        for entry in logs:
+            timestamp = entry.timestamp.split("T", maxsplit=1)[-1].split(
+                ".", maxsplit=1
+            )[0]
+            status = "✅" if entry.success else "❌"
+            output.append(
+                f"[{timestamp}] {status} {entry.tool_name} ({entry.duration_ms:.0f}ms)"
+            )
+            if not entry.success and entry.error:
+                output.append(f"   Error: {entry.error}")
         return "\n".join(output)
-    
-    except Exception as e:
-        return f"❌ Error listing processes: {str(e)}"
+
+    processes = _collect_processes()
+    processes.sort(key=lambda process: process["cpu_percent"], reverse=True)
+    output = ["🖥️ System Process Info (Top 10 by CPU)", ""]
+    output.extend(_format_process(process) for process in processes[:10])
+    return "\n".join(output)
 
 
-async def get_network_stats(params: Dict[str, Any], context: Dict[str, Any]) -> str:
-    """
-    Get network interface statistics
-    
-    Permission: READ
-    Parameters:
-        detailed (optional): Show detailed per-interface stats
-    """
+def list_processes(params: dict[str, Any], context: dict[str, Any]) -> str:
+    """List running processes with optional filtering and sorting."""
+
+    filter_name = params.get("filter", "").lower()
+    sort_by = params.get("sort_by", "cpu")
+    limit = params.get("limit", 15)
+    processes = [
+        process
+        for process in _collect_processes(include_status=True)
+        if not filter_name or filter_name in process["name"].lower()
+    ]
+    sort_key = "memory_percent" if sort_by == "memory" else "cpu_percent"
+    processes.sort(key=lambda process: process[sort_key], reverse=True)
+
+    filter_text = f" (filtered by '{filter_name}')" if filter_name else ""
+    output = [f"🔄 Running Processes{filter_text} (sorted by {sort_by})", ""]
+    output.extend(
+        _format_process(process, include_status=True) for process in processes[:limit]
+    )
+    if len(processes) > limit:
+        output.append(f"\n... and {len(processes) - limit} more processes")
+    return "\n".join(output)
+
+
+def _collect_processes(*, include_status: bool = False) -> list[dict[str, Any]]:
+    attributes = ["pid", "name", "cpu_percent", "memory_percent"]
+    if include_status:
+        attributes.append("status")
+
+    processes: list[dict[str, Any]] = []
     try:
-        detailed = params.get("detailed", False)
-        
-        # Get network interfaces
-        addrs = psutil.net_if_addrs()
-        stats = psutil.net_if_stats()
-        io_counters = psutil.net_io_counters(pernic=True)
-        
-        output = ["🌐 Network Interfaces\n"]
-        
-        for iface_name in sorted(addrs.keys()):
-            # Skip loopback unless detailed
-            if not detailed and ('lo' in iface_name.lower() or iface_name == '127.0.0.1'):
+        for process in psutil.process_iter(attributes):
+            try:
+                info = process.info
+                info["name"] = str(info.get("name") or "unknown")
+                info["cpu_percent"] = float(info.get("cpu_percent") or 0)
+                info["memory_percent"] = float(info.get("memory_percent") or 0)
+                info["status"] = str(info.get("status") or "unknown")
+                processes.append(info)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-            
-            output.append(f"📡 {iface_name}")
-            
-            # Show addresses
-            for addr in addrs[iface_name]:
-                if addr.family == 2:  # AF_INET (IPv4)
-                    output.append(f"   IPv4: {addr.address}")
-                elif addr.family == 10:  # AF_INET6 (IPv6)
-                    if detailed:
-                        output.append(f"   IPv6: {addr.address}")
-            
-            # Show stats
-            if iface_name in stats:
-                stat = stats[iface_name]
-                status = "UP" if stat.isup else "DOWN"
-                speed = f"{stat.speed} Mbps" if stat.speed > 0 else "Unknown"
-                output.append(f"   Status: {status}, Speed: {speed}")
-            
-            # Show I/O counters if available
-            if iface_name in io_counters:
-                io = io_counters[iface_name]
-                sent_mb = io.bytes_sent / (1024**2)
-                recv_mb = io.bytes_recv / (1024**2)
-                output.append(f"   Traffic: ↑{sent_mb:.1f} MB ↓{recv_mb:.1f} MB")
-            
-            output.append("")
-        
-        return "\n".join(output).strip()
-        
-    except Exception as e:
-        return f"❌ Error getting network stats: {str(e)}"
+    except (PermissionError, OSError):
+        pass
+    return processes
 
 
-# Tool definitions for registration
-from tool_gateway import ToolDefinition, ToolPermission
+def _format_process(process: dict[str, Any], *, include_status: bool = False) -> str:
+    text = (
+        f"PID {process['pid']:6d} | {process['name'][:35]:35s} | "
+        f"CPU: {process['cpu_percent']:5.1f}% | MEM: {process['memory_percent']:5.1f}%"
+    )
+    if include_status:
+        text += f" | {process['status']}"
+    return text
+
+
+def get_network_stats(params: dict[str, Any], context: dict[str, Any]) -> str:
+    """Get network interface addresses and traffic counters."""
+
+    detailed = params.get("detailed", False)
+    addresses = psutil.net_if_addrs()
+    stats = psutil.net_if_stats()
+    counters = psutil.net_io_counters(pernic=True)
+    output = ["🌐 Network Interfaces", ""]
+
+    for interface_name in sorted(addresses):
+        interface_addresses = addresses[interface_name]
+        is_loopback = any(
+            address.family == socket.AF_INET and address.address.startswith("127.")
+            for address in interface_addresses
+        )
+        if is_loopback and not detailed:
+            continue
+
+        output.append(f"📡 {interface_name}")
+        for address in interface_addresses:
+            if address.family == socket.AF_INET:
+                output.append(f"   IPv4: {address.address}")
+            elif detailed and address.family == socket.AF_INET6:
+                output.append(f"   IPv6: {address.address}")
+
+        if interface_name in stats:
+            interface_stats = stats[interface_name]
+            status = "UP" if interface_stats.isup else "DOWN"
+            speed = (
+                f"{interface_stats.speed} Mbps"
+                if interface_stats.speed > 0
+                else "Unknown"
+            )
+            output.append(f"   Status: {status}, Speed: {speed}")
+        if interface_name in counters:
+            interface_counters = counters[interface_name]
+            output.append(
+                "   Traffic: "
+                f"↑{interface_counters.bytes_sent / (1024**2):.1f} MB "
+                f"↓{interface_counters.bytes_recv / (1024**2):.1f} MB"
+            )
+        output.append("")
+    return "\n".join(output).strip()
+
 
 SYSTEM_TOOLS = [
     ToolDefinition(
         name="get_system_info",
-        description="Get comprehensive system information including CPU, memory, disk usage, and uptime. Use this to check overall system health.",
+        description=(
+            "Get comprehensive system information including CPU, memory, disk usage, "
+            "and uptime. Use this to check overall system health."
+        ),
         permission=ToolPermission.READ,
         input_schema={
             "type": "object",
             "properties": {},
-            "required": []
+            "additionalProperties": False,
         },
         callback=get_system_info,
-        category="system"
+        category="system",
     ),
     ToolDefinition(
         name="check_disk_space",
-        description="Check disk usage for specific path or all partitions. Use this to monitor disk space.",
+        description=(
+            "Check disk usage for a specific path or all mounted partitions. "
+            "Use this to monitor disk space."
+        ),
         permission=ToolPermission.READ,
         input_schema={
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Optional path to check (e.g., '/', '/home'). If not specified, shows all partitions."
-                },
-                "detailed": {
-                    "type": "boolean",
-                    "description": "Show detailed partition information including device and filesystem type.",
-                    "default": False
-                }
+                "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "detailed": {"type": "boolean", "default": False},
             },
-            "required": []
+            "additionalProperties": False,
         },
         callback=check_disk_space,
-        category="system"
+        category="system",
     ),
     ToolDefinition(
         name="read_logs",
-        description="Read audit logs (tool executions) or system logs (process info). Use this to check what operations have been performed or system activity.",
+        description="Read gateway audit entries or current process activity.",
         permission=ToolPermission.READ,
         input_schema={
             "type": "object",
             "properties": {
                 "log_type": {
                     "type": "string",
-                    "description": "Type of logs to read: 'audit' for tool execution logs, 'system' for process information.",
-                    "default": "audit"
+                    "enum": ["audit", "system"],
+                    "default": "audit",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Number of log entries to return.",
-                    "default": 20
-                }
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 20,
+                },
             },
-            "required": []
+            "additionalProperties": False,
         },
         callback=read_logs,
-        category="monitoring"
+        category="monitoring",
     ),
     ToolDefinition(
         name="list_processes",
-        description="List running processes with filtering and sorting options. Use this to see what's running on the system.",
+        description="List running processes with filtering and sorting options.",
         permission=ToolPermission.READ,
         input_schema={
             "type": "object",
             "properties": {
-                "filter": {
-                    "type": "string",
-                    "description": "Filter processes by name (case-insensitive partial match)."
-                },
+                "filter": {"type": "string", "maxLength": 100},
                 "sort_by": {
                     "type": "string",
-                    "description": "Sort by 'cpu' or 'memory'. Default is 'cpu'.",
-                    "default": "cpu"
+                    "enum": ["cpu", "memory"],
+                    "default": "cpu",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of processes to show.",
-                    "default": 15
-                }
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 15,
+                },
             },
-            "required": []
+            "additionalProperties": False,
         },
         callback=list_processes,
-        category="system"
+        category="system",
     ),
     ToolDefinition(
         name="get_network_stats",
-        description="Get network interface information and statistics. Use this to check network connectivity and traffic.",
+        description="Get network interface information and traffic statistics.",
         permission=ToolPermission.READ,
         input_schema={
             "type": "object",
-            "properties": {
-                "detailed": {
-                    "type": "boolean",
-                    "description": "Show detailed information including IPv6 addresses and loopback interfaces.",
-                    "default": False
-                }
-            },
-            "required": []
+            "properties": {"detailed": {"type": "boolean", "default": False}},
+            "additionalProperties": False,
         },
         callback=get_network_stats,
-        category="network"
-    )
+        category="network",
+    ),
 ]
